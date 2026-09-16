@@ -1,8 +1,11 @@
 # 多机编排尚未上线, 未在真实环境验证过. 暂时不建议使用.
 # tcpfit 服务器清单模板
 #
-# 复制成 servers.yml 后填自己的机器. servers.yml 已被 .gitignore 忽略（含密码）.
+# 复制成 servers.yml 后填自己的机器. servers.yml 已被 .gitignore 忽略（可能含密码）.
 #   cp servers.example.yml servers.yml && chmod 600 servers.yml
+# 编排器会拒绝组/其他用户可读的清单，并强制校验 SSH known_hosts。
+# 首次连接前请通过服务商控制台核对主机指纹并加入 ~/.ssh/known_hosts。
+# 推荐使用 SSH 密钥；password 仅为兼容选项。
 
 # 所有机器的公共默认值, 可被单机覆盖
 defaults:
@@ -18,7 +21,7 @@ servers:
   # ── 洛杉矶 CN 优化线路, 跑代理 ──
   - name: la-panstar
     host: 1.2.3.4
-    password: "改成你的密码"        # 或用 key: ~/.ssh/id_ed25519
+    password: "改成你的密码"        # 兼容选项；优先改用 key
     role: proxy                     # 并发连接多 → 缓冲区默认值取保守值
     bandwidth: 500                  # 标称 Mbps, 用于推导 BDP 和 sweep 起止范围
     peer: la.speedtest.clouvider.net

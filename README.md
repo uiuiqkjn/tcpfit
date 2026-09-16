@@ -2,23 +2,27 @@
 
 按每台机器实测推导的 TCP 调优工具. 不套用固定参数, 实测 BDP 与限速器拐点.
 
-本脚本由 [kylin010](https://github.com/Kylin010) 编写和维护.
+本脚本由 [kylin010](https://github.com/Kylin010) 编写；本 fork 增加了供应链、SSH 与隐私加固.
 
 ## 安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh)
+git clone https://github.com/uiuiqkjn/tcpfit.git
+cd tcpfit
+sha256sum -c SHA256SUMS
+sudo ./install.sh
 ```
 
-跑完直接出菜单, 选 1 全自动. 脚本会装到 `/usr/local/bin/tcpfit`, 以后敲 `tcpfit` 即可.
+安装器只使用已经下载并校验的本地文件，不支持 `curl | bash`，也不会以 root 身份二次下载代码。
+完成后运行 `sudo tcpfit`，选 1 可进入全自动流程.
 
 ## 三种用法
 
 | 用法 | 命令 |
 |---|---|
-| 一键跑 | `bash <(curl -fsSL .../main/tcpfit.sh)` |
-| 装好后 | `tcpfit` |
-| 子命令 | `tcpfit tune --role proxy --bw 500` |
+| 安装 | `sha256sum -c SHA256SUMS && sudo ./install.sh` |
+| 装好后 | `sudo tcpfit` |
+| 子命令 | `sudo tcpfit tune --role proxy --bw 500` |
 
 ## 菜单
 
@@ -36,8 +40,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
    u. 卸载 tcpfit
 ```
 
-脚本不会自动更新. 装好之后跑的一直是装的那一版, 想升级用菜单 8 或 `tcpfit update` ——
-它只检查, 发现新版本会问你要不要更新.
+脚本不会自动更新或替换自身. 菜单 8 或 `tcpfit update` 只检查版本并显示 release 地址；
+升级时重新下载完整 release、校验 `SHA256SUMS`、审阅变更后运行本地安装器.
+
+## 隐私与联网
+
+运行计数默认关闭。只有显式设置 `TCPFIT_TELEMETRY=1`，或创建
+`/var/lib/tcpfit/telemetry-enabled` 后，菜单启动才会请求
+`https://tcpfit.spacevps.cc/ping?v=<版本>`。应用层只发送版本号，但服务端仍能看到来源 IP、
+时间及 HTTP/TLS 元数据。删除标记文件并取消环境变量即可再次关闭。
+
+测速会连接用户选择的 iperf3 对端；选择公共节点时，相应服务商会看到来源 IP 和测试流量。
 
 一键调优只问三个问题: 带宽、测速对端、机器用途. 确认之后跑到底不再打断.
 
@@ -91,6 +104,10 @@ default dev ppp0 scope link          # 点对点, 没有 via
 ## 多机（未上线）
 
 多机编排还没在真实环境验证过, 暂时不建议使用. 下面的用法仅供参考.
+
+编排器现在强制验证 SSH 主机密钥。第一次连接前，请通过服务商控制台等可信渠道核对主机
+指纹，并将它加入 `~/.ssh/known_hosts`；不能通过验证时会直接停止，不会静默接受新密钥。
+优先使用 SSH 密钥。兼容的密码字段通过匿名管道交给 `sshpass`，不会出现在命令行参数中。
 
 
 ```bash

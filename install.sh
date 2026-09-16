@@ -3,21 +3,22 @@
 #
 # 两种用法：
 #
-#   1) 在目标 VPS 上直接跑（只装 agent, 单机调优）
-#      curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/install.sh | bash
+#   1) 下载完整仓库、核对 SHA256SUMS 后在目标 VPS 上跑（只装 agent）
+#      sudo ./install.sh
 #      然后: tcpfit detect
 #
 #   2) 在控制端跑（装完整项目, 管理多台机器 —— 未上线, 尚未在真实环境验证）
-#      curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/install.sh | bash -s -- --full
+#      sudo ./install.sh --full
 #      然后: cd /opt/tcpfit && python3 orchestrator/fleet.py detect
 
 set -euo pipefail
 
-REPO="Kylin010/tcpfit"
-RAW="https://raw.githubusercontent.com/$REPO/main"
 PREFIX="${PREFIX:-/usr/local/bin}"
 PROJECT_DIR="${PROJECT_DIR:-/opt/tcpfit}"
 MODE=agent
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || exit 1
+AGENT_SRC="$SCRIPT_DIR/tcpfit.sh"
+SUMS_SRC="$SCRIPT_DIR/SHA256SUMS"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,13 +36,19 @@ ok(){  printf '\033[0;32m[+]\033[0m %s\n' "$*"; }
 die(){ printf '\033[0;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "需要 root"
-command -v curl >/dev/null || die "需要 curl"
+[ -f "$AGENT_SRC" ] && [ -f "$SUMS_SRC" ] || \
+  die "必须从完整的本地仓库运行 ./install.sh；不支持 curl | bash"
+command -v sha256sum >/dev/null || die "需要 sha256sum 校验本地文件"
+(
+  cd "$SCRIPT_DIR"
+  grep -E '  (tcpfit\.sh|install\.sh)$' SHA256SUMS | sha256sum -c - >/dev/null
+) || die "SHA256SUMS 校验失败，拒绝以 root 安装"
 
 if [ "$MODE" = agent ]; then
   say "安装 agent 到 $PREFIX"
-  curl -fsSL "$RAW/tcpfit.sh" -o "$PREFIX/tcpfit" \
-    || die "下载失败, 检查网络或 GitHub 可达性"
-  chmod +x "$PREFIX/tcpfit"
+  install -d -m 755 "$PREFIX"
+  install -m 755 "$AGENT_SRC" "$PREFIX/.tcpfit.new.$$" || die "写入临时文件失败"
+  mv -f "$PREFIX/.tcpfit.new.$$" "$PREFIX/tcpfit" || die "安装失败"
   rm -f /usr/local/sbin/tcpfit.sh          # 清掉 v0.3.1 及更早的安装位置
   ok "已安装: $PREFIX/tcpfit"
 
@@ -68,19 +75,9 @@ fi
 
 # ── 完整项目 ────────────────────────────────────────────────────────────────
 say "部署完整项目到 $PROJECT_DIR"
-
-if command -v git >/dev/null 2>&1; then
-  if [ -d "$PROJECT_DIR/.git" ]; then
-    say "已存在, 拉取更新"
-    git -C "$PROJECT_DIR" pull --ff-only || die "更新失败, 本地可能有改动"
-  else
-    git clone --depth 1 "https://github.com/$REPO.git" "$PROJECT_DIR" || die "克隆失败"
-  fi
-else
-  say "无 git, 改用 tarball"
-  mkdir -p "$PROJECT_DIR"
-  curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/main" \
-    | tar xz -C "$PROJECT_DIR" --strip-components=1 || die "下载失败"
+if [ "$SCRIPT_DIR" != "$PROJECT_DIR" ]; then
+  install -d -m 755 "$PROJECT_DIR"
+  cp -a "$SCRIPT_DIR/." "$PROJECT_DIR/" || die "复制本地项目失败"
 fi
 
 chmod +x "$PROJECT_DIR/tcpfit.sh" "$PROJECT_DIR/orchestrator/fleet.py" 2>/dev/null || true

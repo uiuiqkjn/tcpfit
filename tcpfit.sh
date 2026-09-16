@@ -22,16 +22,16 @@
 #   tcpfit.sh archive delete <序号>         删除（0000 不可删）
 #   tcpfit.sh uninstall [--keep-archives]   卸载：回滚 + 删配置 + 删自己
 #
-# 运行计数: 启动时会向 tcpfit.spacevps.cc 发一次匿名计数请求（纯计数, 不含任何
-#           机器标识, 只带版本号）, 用于显示"今天多少次 / 累计多少次".
-#           关掉:  TCPFIT_NO_TELEMETRY=1   或   touch /var/lib/tcpfit/no-telemetry
+# 可选运行计数: 默认关闭。启用后，菜单启动时会向 tcpfit.spacevps.cc 发送版本号；
+#               服务端同时能看到来源 IP、时间和 HTTP/TLS 元数据。
+#               启用: TCPFIT_TELEMETRY=1，或 touch /var/lib/tcpfit/telemetry-enabled
 #
 # 退出码: 0 成功 / 1 参数或环境错误 / 2 实测失败
 
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.8"
+VERSION="0.5.8-security.1"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -81,14 +81,26 @@ _rpad(){ local w; w=$(_dispw "$1"); printf '%*s%s' $(( $2 - w )) "" "$1"; }
 _conf(){ printf '      %s %s\n' "$(_pad "$1" 14)" "$2"; }
 
 # 同时跑两个实例会同时抢 qdisc、快照和 sysctl. 用文件锁串行化.
-LOCK_FILE="/var/lock/tcpfit.lock"
+LOCK_DIR="/run/lock/tcpfit"
+LOCK_FILE="$LOCK_DIR/tcpfit.lock"
 take_lock(){
   command -v flock >/dev/null || return 0
-  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+  # 固定锁文件不能直接放在可能带 sticky bit、允许普通用户创建文件的 /var/lock
+  # 根目录，否则旧系统上可能被预置成 symlink，让 root 的重定向截断别的文件。
+  # 先建立 root 独占目录，攻击者无法在检查与打开之间替换锁文件。
+  if [ "$(id -u)" = 0 ]; then
+    mkdir -p "$LOCK_DIR" 2>/dev/null || die "无法创建锁目录: $LOCK_DIR"
+    chown root:root "$LOCK_DIR" 2>/dev/null || die "无法设置锁目录所有者: $LOCK_DIR"
+    chmod 700 "$LOCK_DIR" 2>/dev/null || die "无法保护锁目录: $LOCK_DIR"
+  else
+    mkdir -p "$LOCK_DIR" 2>/dev/null || return 0
+  fi
+  [ -L "$LOCK_FILE" ] && die "锁文件不能是符号链接: $LOCK_FILE"
   # 注意不能写成 exec 9>FILE 2>/dev/null —— 那个 2>/dev/null 会被 exec 当成
   # 永久重定向, 把整个脚本的 stderr 都吞掉, 所有 die/warn 就都看不见了.
-  [ -w "$(dirname "$LOCK_FILE")" ] || return 0
+  [ -w "$LOCK_DIR" ] || return 0
   exec 9>"$LOCK_FILE" || return 0
+  chmod 600 "$LOCK_FILE" 2>/dev/null || true
   flock -n 9 && return 0
 
   # 锁被占: 可能真有另一个在跑, 也可能是上次异常退出(SSH 断线/被 kill)卡住了.
@@ -326,30 +338,24 @@ disp(){
   [ -x "$SELF_PATH" ] && { echo "tcpfit"; return; }
   case "$0" in /dev/fd/*|/proc/self/fd/*|bash|-bash) echo "$SELF_PATH" ;; *) echo "$0" ;; esac
 }
-# 装到系统里的那一份, 必须和「你刚跑的这一份」是同一个版本.
-#
-# 原先无条件拉 main：你按 v0.3.0 下载、校验、运行, 它转头把 main 装进
-# /usr/local/sbin —— 之后每次敲 tcpfit.sh 跑的都是没校验过的代码,
-# 固定版本的意义被完全抵消. （我自己踩过：推完新版去远端验证, 看到的还是旧菜单.)
-#
-# 为什么不能直接复制"正在运行的脚本"：bash <(curl ...) 时 $0 是 /dev/fd/63,
-# 内容已被 bash 读走, 再 cat 只能读到 0 字节；curl | bash 时 $0 = bash, 根本不可读.
-# 实测验证过这两种情况. 所以只能按版本号回拉, 并校验拉到的确实是同一版.
-SELF_URL="https://raw.githubusercontent.com/Kylin010/tcpfit/v${VERSION}/tcpfit.sh"
+# 装到系统里的那一份, 必须就是用户已经下载并审阅的当前文件。
+# 不再以 root 二次联网拉取标签：版本字符串不是内容认证，仓库或标签被篡改时
+# 会把未经审阅的代码装成 root 可执行文件。process substitution / pipe 没有可安全
+# 重读的普通文件，因此这两种启动方式只运行、不持久安装，并提示使用本地安装器。
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac      # 已经是装好的那份
-  command -v curl >/dev/null || return 0
-  curl -fsSL "$SELF_URL" -o "$SELF_PATH".tmp 2>/dev/null || return 0
-  # 校验版本一致. 开发期 main 领先 tag 时这里会失败, 跳过安装也是对的.
-  if [ -s "$SELF_PATH".tmp ] && starts_with "$(head -1 "$SELF_PATH".tmp 2>/dev/null)" '#!' \
-     && grep -q "^VERSION=\"$VERSION\"" "$SELF_PATH".tmp; then
-    mv "$SELF_PATH".tmp "$SELF_PATH"; chmod +x "$SELF_PATH"
-    rm -f "$LEGACY_SELF"                      # 清掉旧位置, 免得两份不同版本并存
-    ok "Installed: run 'tcpfit' anytime"
-  else
-    rm -f "$SELF_PATH".tmp
-  fi
+  case "$0" in
+    /dev/fd/*|/proc/self/fd/*|bash|-bash)
+      warn "当前脚本来自管道或临时文件，出于供应链安全考虑不会自动二次下载并安装."
+      warn "需要持久安装时，请下载完整仓库、校验 SHA256SUMS 后运行 ./install.sh."
+      return 0 ;;
+  esac
+  [ -f "$0" ] && [ -r "$0" ] || return 0
+  install -m 755 -- "$0" "${SELF_PATH}.new" 2>/dev/null || return 0
+  mv -f -- "${SELF_PATH}.new" "$SELF_PATH" || { rm -f "${SELF_PATH}.new"; return 0; }
+  rm -f "$LEGACY_SELF"                      # 清掉旧位置, 免得两份不同版本并存
+  ok "Installed reviewed local copy: run 'tcpfit' anytime"
 }
 
 # ── 从旧名字 nettune 迁移 ──────────────────────────────────────────────────
@@ -884,11 +890,11 @@ check_ping_variant(){
   return 1
 }
 
-# ── 运行计数 ────────────────────────────────────────────────────────────────
-# 纯计数: 跑一次算一次, 不生成也不发送任何机器标识, 服务端无法区分
-# "一台机器跑十次" 和 "十台各跑一次". 只额外带版本号, 用来判断旧版还有多少人在用.
+# ── 可选运行计数 ────────────────────────────────────────────────────────────
+# 默认关闭。启用后应用层只发送版本号，但 HTTPS 服务端天然还能看到来源 IP、
+# 请求时间和 HTTP/TLS 元数据，因此不能称作完全匿名。
 #
-# 关掉:  TCPFIT_NO_TELEMETRY=1   或   touch /var/lib/tcpfit/no-telemetry
+# 启用:  TCPFIT_TELEMETRY=1   或   touch /var/lib/tcpfit/telemetry-enabled
 #
 # 三条硬约束:
 #   1. 后台发, 绝不阻塞任何一步 —— 统计挂了/域名没了/用户在墙内, 调优照跑
@@ -897,15 +903,15 @@ check_ping_variant(){
 STATS_URL="https://tcpfit.spacevps.cc/ping"
 STATS_CACHE="$STATE_DIR/stats.json"
 
-telemetry_off(){
-  [ -n "${TCPFIT_NO_TELEMETRY:-}" ] && return 0
-  [ -f "$STATE_DIR/no-telemetry" ] && return 0
+telemetry_on(){
+  [ "${TCPFIT_TELEMETRY:-0}" = 1 ] && return 0
+  [ -f "$STATE_DIR/telemetry-enabled" ] && return 0
   return 1
 }
 
 # 后台打一次, 结果写进缓存供【下次】显示. 不等待, 不检查返回码.
 telemetry_ping(){
-  telemetry_off && return 0
+  telemetry_on || return 0
   command -v curl >/dev/null 2>&1 || return 0
   mkdir -p "$STATE_DIR" 2>/dev/null || return 0
   (
@@ -920,7 +926,7 @@ telemetry_ping(){
 
 # 读缓存, 给 banner 用. 没有缓存就返回空, banner 那一行整个不显示.
 telemetry_line(){
-  telemetry_off && return 0
+  telemetry_on || return 0
   [ -f "$STATS_CACHE" ] || return 0
   local t n
   t=$(sed -n 's/.*"today"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$STATS_CACHE" 2>/dev/null)
@@ -1390,7 +1396,7 @@ cmd_uninstall(){
   fi
   echo
   ok "tcpfit 已卸载. 机器回到了出厂状态."
-  echo "  重新装:  bash <(curl -fsSL $SELF_URL)"
+  echo "  重新装: 下载完整仓库，校验 SHA256SUMS 后运行 sudo ./install.sh"
 }
 
 cmd_rollback(){
@@ -2779,10 +2785,7 @@ cmd_verify(){
 cmd_update(){
   need_root
   command -v curl >/dev/null || die "需要 curl"
-  # 菜单调进来时带 --from-menu: 更新完要用新版本 exec 掉自己, 否则用户在同一个
-  # 菜单里接着操作, 跑的仍是内存里的旧代码.
-  local from_menu=0
-  [ "${1:-}" = "--from-menu" ] && { from_menu=1; shift; }
+  [ "${1:-}" = "--from-menu" ] && shift
   info "检查更新…"
   local latest
   # 只看 release, 不看 main —— main 可能领先于任何已发布版本
@@ -2801,45 +2804,11 @@ cmd_update(){
   _conf "最新版本" "v$latest"
   _conf "更新说明" "https://github.com/Kylin010/tcpfit/releases/tag/v$latest"
   echo
-  confirm "  现在更新？" y || { info "已取消"; return 0; }
-
-  # 从 release 下, 用发布的 SHA256SUMS 校验. 只对比 tcpfit.sh 那一行 ——
-  # SHA256SUMS 里还有 install.sh, 直接 sha256sum -c 会因为文件不在而失败.
-  local dl; dl=$(mktemp -d)
-  local base="https://github.com/Kylin010/tcpfit/releases/download/v$latest"
-  if ! curl -fsSL --max-time 60 "$base/tcpfit.sh" -o "$dl/tcpfit.sh"; then
-    rm -rf "$dl"; die "下载失败" 2
-  fi
-  if command -v sha256sum >/dev/null && curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$dl/SHA256SUMS"; then
-    if ! ( cd "$dl" && grep ' tcpfit\.sh$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ); then
-      rm -rf "$dl"; die "SHA256 校验不通过, 未更新" 2
-    fi
-    info "SHA256 校验通过"
-  else
-    warn "取不到 SHA256SUMS 或没有 sha256sum, 退回版本号校验"
-  fi
-  if ! { starts_with "$(head -1 "$dl/tcpfit.sh" 2>/dev/null)" '#!' && grep -q "^VERSION=\"$latest\"" "$dl/tcpfit.sh"; }; then
-    rm -rf "$dl"; die "下载的文件校验不通过, 未更新" 2
-  fi
-  # 不能原地覆盖 —— 正在执行的就是 $SELF_PATH, 而 bash 是按文件偏移增量读脚本的,
-  # 原地改写有可能让它读到新文件的错位内容（两个版本长度还不一样）.
-  # 先写同目录的 .new 再 mv: rename 是原子的, 换新 inode, 旧 inode 对当前进程保持有效.
-  if ! install -m 755 "$dl/tcpfit.sh" "${SELF_PATH}.new" || ! mv -f "${SELF_PATH}.new" "$SELF_PATH"; then
-    rm -f "${SELF_PATH}.new"; rm -rf "$dl"; die "写入 $SELF_PATH 失败" 2
-  fi
-  rm -rf "$dl"
-  ok "已更新到 v$latest"
-  info "配置和快照不受影响."
-
-  # 关键: 磁盘上换了, 但当前进程内存里跑的还是旧代码.
-  # 早期版本这里只打一句"重跑一次调优", 用户就在同一个菜单里按 1 —— 跑的仍是旧版本,
-  # 于是"更新了但 bug 还在". 有客户真踩过, 排查了很久才定位到是这里.
-  if [ "$from_menu" = 1 ]; then
-    info "以新版本重启…"
-    echo
-    exec "$SELF_PATH" menu
-  fi
-  warn "当前进程跑的仍是 v${VERSION} 的代码, 重新运行 tcpfit 才会用上新版本."
+  warn "安全模式下 tcpfit 不会让 root 进程从网络下载并替换自身。"
+  echo "  请在普通用户目录下载完整 release，核对发布者与 SHA256SUMS，"
+  echo "  审阅变更后再以 root 运行本地 ./install.sh。"
+  echo
+  echo "  Release: https://github.com/Kylin010/tcpfit/releases/tag/v$latest"
 }
 
 # ── 交互式菜单 ──────────────────────────────────────────────────────────────

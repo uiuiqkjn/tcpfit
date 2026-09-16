@@ -30,6 +30,7 @@ import concurrent.futures as cf
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -37,6 +38,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+# 清单、执行结果可能包含主机地址、系统画像和认证信息。默认只允许当前用户读取。
+os.umask(0o077)
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENT = ROOT / "tcpfit.sh"
@@ -68,7 +72,10 @@ class Host:
         self.host = d["host"]
         self.port = int(d.get("port", 22))
         self.user = d.get("user","root")
-        self.password = d.get("password")
+        password = d.get("password")
+        self.password = str(password) if password is not None else None
+        if self.password and ("\n" in self.password or "\x00" in self.password):
+            die(f"{self.name}: password 不能包含换行或 NUL")
         self.key = d.get("key")
         self.tags = d.get("tags", []) or []
         # 调优参数
@@ -84,12 +91,14 @@ class Host:
     def ssh_base(self):
         cmd = []
         if self.password:
-            cmd += ["sshpass","-p", self.password]
-        cmd += ["ssh","-o","StrictHostKeyChecking=no",
-                "-o","UserKnownHostsFile=/dev/null",
+            # -p 会把密码短暂暴露在进程参数和审计日志里。-d 0 从匿名管道读取。
+            cmd += ["sshpass","-d","0"]
+        cmd += ["ssh","-o","StrictHostKeyChecking=yes",
                 "-o","LogLevel=ERROR",
                 "-o","ConnectTimeout=20",
                 "-p", str(self.port)]
+        if not self.password:
+            cmd += ["-o", "BatchMode=yes"]
         if self.key:
             cmd += ["-i", os.path.expanduser(self.key)]
         cmd += [f"{self.user}@{self.host}"]
@@ -98,10 +107,11 @@ class Host:
     def scp_to(self, local, remote):
         cmd = []
         if self.password:
-            cmd += ["sshpass","-p", self.password]
-        cmd += ["scp","-o","StrictHostKeyChecking=no",
-                "-o","UserKnownHostsFile=/dev/null",
+            cmd += ["sshpass","-d","0"]
+        cmd += ["scp","-o","StrictHostKeyChecking=yes",
                 "-o","LogLevel=ERROR","-P", str(self.port)]
+        if not self.password:
+            cmd += ["-o", "BatchMode=yes"]
         if self.key:
             cmd += ["-i", os.path.expanduser(self.key)]
         cmd += [str(local), f"{self.user}@{self.host}:{remote}"]
@@ -112,6 +122,9 @@ def load_inventory(path, only=None, tag=None):
     p = Path(path)
     if not p.exists():
         die(f"清单不存在: {p}\n  先复制模板: cp {ROOT}/inventory/servers.example.yml {p}")
+    mode = stat.S_IMODE(p.stat().st_mode)
+    if mode & 0o077:
+        die(f"清单权限过宽: {p} 是 {mode:04o}，请执行 chmod 600 {shlex.quote(str(p))}")
     data = yaml.safe_load(p.read_text()) or {}
     servers = data.get("servers") or []
     if not servers:
@@ -151,7 +164,9 @@ def run_remote(h, command, timeout=1800, dry=False):
         return Result(h, 0,"(dry-run)","", 0.0)
     t0 = time.time()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        auth_input = f"{h.password}\n" if h.password else None
+        p = subprocess.run(cmd, input=auth_input, capture_output=True,
+                           text=True, timeout=timeout)
         return Result(h, p.returncode, p.stdout, p.stderr, time.time() - t0)
     except subprocess.TimeoutExpired:
         return Result(h, 124,"", f"超时 ({timeout}s)", time.time() - t0)
@@ -164,7 +179,9 @@ def push_agent(h, dry=False):
     if dry:
         print(f"  {C['y']}[dry]{C['0']} {h.name}: scp agent → {REMOTE_AGENT}")
         return True
-    p = subprocess.run(h.scp_to(AGENT, REMOTE_AGENT), capture_output=True, text=True, timeout=120)
+    auth_input = f"{h.password}\n" if h.password else None
+    p = subprocess.run(h.scp_to(AGENT, REMOTE_AGENT), input=auth_input,
+                       capture_output=True, text=True, timeout=120)
     if p.returncode != 0:
         return False
     r = run_remote(h, f"chmod +x {REMOTE_AGENT}", timeout=60)
@@ -197,13 +214,15 @@ def report(results, title):
 
 
 def archive(results, action):
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(mode=0o700, exist_ok=True)
+    RESULTS.chmod(0o700)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = RESULTS / f"{stamp}-{action}.json"
     path.write_text(json.dumps([{
         "name": r.host.name,"host": r.host.host,"rc": r.rc,
         "seconds": round(r.secs, 1),"stdout": r.out,"stderr": r.err,
     } for r in results], ensure_ascii=False, indent=2))
+    path.chmod(0o600)
     log(f"结果已存档: {path.relative_to(ROOT)}")
 
 
